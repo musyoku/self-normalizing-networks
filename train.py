@@ -8,6 +8,9 @@ from chainer import links as L
 from chainer import functions as F
 from selu import selu
 
+
+from PIL import Image
+
 def _sum_sqnorm(arr):
 	sq_sum = collections.defaultdict(float)
 	for x in arr:
@@ -18,41 +21,67 @@ def _sum_sqnorm(arr):
 	return sum([float(i) for i in six.itervalues(sq_sum)])
 	
 class GradientClipping(object):
-	name = 'GradientClipping'
+	name = "GradientClipping"
 
 	def __init__(self, threshold):
 		self.threshold = threshold
 
 	def __call__(self, opt):
-		norm = np.sqrt(_sum_sqnorm([p.grad for p in opt.target.params(False)]))
+		norm = np.sqrt(_sum_sqnorm([p.grad for p in opt.target.params()]))
 		assert norm != 0
+		if norm < self.threshold:
+			return
 		rate = self.threshold / norm
-		if rate < 1:
-			for param in opt.target.params(False):
-				grad = param.grad
-				with cuda.get_device_from_array(grad):
-					grad *= rate
+		for param in opt.target.params():
+			grad = param.grad
+			with cuda.get_device(grad):
+				grad *= rate
 
-class SeluModel(chainer.Chain):
+class SELUModel(chainer.Chain):
 	def __init__(self):
-		super(SeluModel, self).__init__(
-			l1=L.Linear(784, 1200),
+		super(SELUModel, self).__init__(
+			l1=L.Linear(None, 1200),
 			l2=L.Linear(None, 1200),
 			l3=L.Linear(None, 10),
 		)
 
 	def __call__(self, x, apply_softmax=True):
+		xp = self.xp
 		out = selu(self.l1(x))
+		# print(xp.mean(out.data), xp.std(out.data))
 		out = selu(self.l2(out))
+		# print(xp.mean(out.data), xp.std(out.data))
 		out = self.l3(out)
+		# print(out)
+		# print(xp.mean(out.data), xp.std(out.data))
 		if apply_softmax:
 			out = F.softmax(out)
 		return out
 
-class ReluBatchNormModel(chainer.Chain):
+class SELUDeepModel(chainer.Chain):
+	def __init__(self, num_layers=20):
+		super(SELUDeepModel, self).__init__(
+			logits=L.Linear(None, 10),
+		)
+		self.num_layers = num_layers
+		for idx in xrange(num_layers):
+			self.add_link("layer_%s" % idx, L.Linear(None, 1000))
+
+	def __call__(self, x, apply_softmax=True):
+		xp = self.xp
+		out = x
+		for idx in xrange(self.num_layers):
+			layer = getattr(self, "layer_%s" % idx)
+			out = selu(layer(out))
+		out = self.logits(out)
+		if apply_softmax:
+			out = F.softmax(out)
+		return out
+
+class ReLUBatchNormModel(chainer.Chain):
 	def __init__(self):
-		super(ReluBatchNormModel, self).__init__(
-			l1=L.Linear(784, 1200),
+		super(ReLUBatchNormModel, self).__init__(
+			l1=L.Linear(None, 1200),
 			l2=L.Linear(None, 1200),
 			l3=L.Linear(None, 10),
 			bn1=L.BatchNormalization(1200),
@@ -63,6 +92,48 @@ class ReluBatchNormModel(chainer.Chain):
 		out = self.bn1(F.relu(self.l1(x)))
 		out = self.bn2(F.relu(self.l2(out)))
 		out = self.l3(out)
+		if apply_softmax:
+			out = F.softmax(out)
+		return out
+
+class ReLUBatchNormDeepModel(chainer.Chain):
+	def __init__(self, num_layers=20):
+		super(ReLUBatchNormDeepModel, self).__init__(
+			logits=L.Linear(None, 10),
+		)
+		self.num_layers = num_layers
+		for idx in xrange(num_layers):
+			self.add_link("layer_%s" % idx, L.Linear(None, 1000))
+			self.add_link("bn_%s" % idx, L.BatchNormalization(1000))
+
+	def __call__(self, x, apply_softmax=True):
+		xp = self.xp
+		out = x
+		for idx in xrange(self.num_layers):
+			layer = getattr(self, "layer_%s" % idx)
+			batchnorm = getattr(self, "bn_%s" % idx)
+			out = batchnorm(F.relu(layer(out)))
+		out = self.logits(out)
+		if apply_softmax:
+			out = F.softmax(out)
+		return out
+
+class ELUDeepModel(chainer.Chain):
+	def __init__(self, num_layers=20):
+		super(ELUDeepModel, self).__init__(
+			logits=L.Linear(None, 10),
+		)
+		self.num_layers = num_layers
+		for idx in xrange(num_layers):
+			self.add_link("layer_%s" % idx, L.Linear(None, 1000))
+
+	def __call__(self, x, apply_softmax=True):
+		xp = self.xp
+		out = x
+		for idx in xrange(self.num_layers):
+			layer = getattr(self, "layer_%s" % idx)
+			out = F.elu(layer(out))
+		out = self.logits(out)
 		if apply_softmax:
 			out = F.softmax(out)
 		return out
@@ -86,19 +157,18 @@ def get_unit_vector(v):
 	return v / (xp.sqrt(xp.sum(v ** 2, axis=1)).reshape((-1, 1)) + 1e-16)
 
 def compute_lds(model, x, xi=10, eps=1, Ip=1):
+	xp = cuda.get_array_module(x)
 	y1 = model(x, apply_softmax=True)
 	y1.unchain_backward()
-	xp = cuda.get_array_module(x)
-	d = get_unit_vector(np.random.normal(size=x.shape).astype(np.float32))
+	d = Variable(get_unit_vector(np.random.normal(size=x.shape).astype(np.float32)))
 	if xp is cupy:
-		d = cuda.to_gpu(d)
+		d.to_gpu()
 
 	for i in xrange(Ip):
-		d = Variable(d)
 		y2 = model(x + xi * d, apply_softmax=True)
 		kld = F.sum(compute_kld(y1, y2))
 		kld.backward()
-		d = get_unit_vector(d.grad)
+		d = Variable(get_unit_vector(d.grad))
 	
 	y2 = model(x + eps * d, apply_softmax=True)
 	return -compute_kld(y1, y2)
@@ -115,10 +185,8 @@ def get_mnist():
 		test_label.append(data[1])
 	train_data = np.asanyarray(train_data, dtype=np.float32)
 	test_data = np.asanyarray(test_data, dtype=np.float32)
-	# train_data = (train_data - np.mean(train_data)) / np.std(train_data)
-	# test_data = (test_data - np.mean(test_data)) / np.std(test_data)
-	train_data = 2 * train_data - 1
-	test_data = 2 * test_data - 1
+	train_data = (train_data - np.mean(train_data)) / np.std(train_data)
+	test_data = (test_data - np.mean(test_data)) / np.std(test_data)
 	return (train_data, np.asanyarray(train_label, dtype=np.int32)), (test_data, np.asanyarray(test_label, dtype=np.int32))
 
 def compute_accuracy(model, x, t, num_clusters=10):
@@ -127,24 +195,28 @@ def compute_accuracy(model, x, t, num_clusters=10):
 		x = cuda.to_gpu(x)
 		t = cuda.to_gpu(t)
 	with chainer.using_config("Train", False):
-		probs = F.softmax(model(x, apply_softmax=True)).data
+		batches = xp.array_split(x, len(x) // 128)
+		probs = None
+		for batch in batches:
+			if batch.size > 0:
+				p = F.softmax(model(batch, apply_softmax=True)).data
+				probs = p if probs is None else xp.concatenate((probs, p), axis=0)
 		labels_predict = xp.argmax(probs, axis=1)
-		predict_counts = np.zeros((10, num_clusters), dtype=np.float32)
+		predict_counts = np.zeros((10, num_clusters), dtype=int)
 
 		for i in xrange(len(x)):
 			label_predict = int(labels_predict[i])
 			label_true = int(t[i])
-			predict_counts[label_true][label_predict] += 1
+			predict_counts[label_true, label_predict] += 1
 
-		probs = np.transpose(predict_counts) / np.reshape(np.sum(np.transpose(predict_counts), axis=1), (num_clusters, 1))
-		indices = np.argmax(probs, axis=1)
+		indices = np.argmax(predict_counts, axis=0)
 		match_count = np.zeros((10,), dtype=np.float32)
 		for i in xrange(num_clusters):
 			assinged_label = indices[i]
 			match_count[assinged_label] += predict_counts[assinged_label][i]
 
 		accuracy = np.sum(match_count) / len(x)
-		return predict_counts.astype(np.int), accuracy
+		return predict_counts, accuracy
 
 def train(args):
 	try:
@@ -152,9 +224,14 @@ def train(args):
 	except:
 		pass
 	mnist_train, mnist_test = get_mnist()
+
+	# seed
+	np.random.seed(args.seed)
+	if args.gpu_device != -1:
+		cuda.cupy.random.seed(args.seed)
 		
 	# init model
-	model = ReluBatchNormModel()
+	model = SELUDeepModel()
 	if args.gpu_device >= 0:
 		cuda.get_device(args.gpu_device).use()
 		model.to_gpu()
@@ -176,11 +253,16 @@ def train(args):
 	train_loop = len(train_data) // args.batchsize
 	train_indices = np.arange(len(train_data))
 
+    # training cycle
 	for epoch in xrange(1, args.epoch):
 		np.random.shuffle(train_indices)	# shuffle data
 		sum_loss = 0
+		sum_hy = 0
+		sum_hy_x = 0
+		sum_Rsat = 0
 
 		with chainer.using_config("Train", True):
+	        # loop over all batches
 			for itr in xrange(train_loop):
 				# sample minibatch
 				batch_range = np.arange(itr * args.batchsize, (itr + 1) * args.batchsize)
@@ -194,27 +276,30 @@ def train(args):
 
 				p = model(x, apply_softmax=True)
 
+				# compute loss
 				hy = compute_marginal_entropy(p)
 				hy_x = F.mean(compute_entropy(p))
 				Rsat = -F.mean(compute_lds(model, x))
-
 				loss = Rsat - lam * (mu * hy - hy_x)
+				loss = F.softmax_cross_entropy(model(x, apply_softmax=False), Variable(t))
 
-				model.cleargrads()
-				loss.backward()
-				optimizer.update()
+				# update weights
+				optimizer.update(lossfun=lambda: loss)
 
 				if itr % 50 == 0:
 					sys.stdout.write("\riteration {}/{}".format(itr, train_loop))
 					sys.stdout.flush()
 				sum_loss += float(loss.data)
+				sum_hy += float(hy.data)
+				sum_hy_x += float(hy_x.data)
+				sum_Rsat += float(Rsat.data)
 
 		with chainer.using_config("Train", False):
 			counts_train, accuracy_train = compute_accuracy(model, train_data, train_label)
 			test_data, test_label = mnist_test
 			counts_test, accuracy_test = compute_accuracy(model, test_data, test_label)
 
-		sys.stdout.write("\r\033[2KEpoch {} - loss {:.5f} - acc {:.4f} (train), {:.4f} (test)\n".format(epoch, sum_loss / train_loop, accuracy_train, accuracy_test))
+		sys.stdout.write("\r\033[2KEpoch {} - loss: {:.5f} - acc: {:.4f} (train), {:.4f} (test) - hy: {:.4f} - hy_x: {:.4f} - Rsat: {:.4f}\n".format(epoch, sum_loss / train_loop, accuracy_train, accuracy_test, sum_hy / train_loop, sum_hy_x / train_loop, sum_Rsat / train_loop))
 		sys.stdout.flush()
 		print(counts_train)
 		print(counts_test)
@@ -223,8 +308,9 @@ if __name__ == "__main__":
 	parser = argparse.ArgumentParser()
 	parser.add_argument("--out", "-o", type=str, default="model")
 	parser.add_argument("--gpu-device", "-g", type=int, default=0)
-	parser.add_argument("--learning-rate", "-lr", type=float, default=0.01)
+	parser.add_argument("--learning-rate", "-lr", type=float, default=0.002)
 	parser.add_argument("--epoch", "-e", type=int, default=500)
 	parser.add_argument("--batchsize", "-b", type=int, default=256)
+	parser.add_argument("--seed", "-seed", type=int, default=0)
 	args = parser.parse_args()
 	train(args)

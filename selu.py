@@ -15,7 +15,7 @@ class SELU(function.Function):
 
 	def forward_cpu(self, x):
 		y = x[0].copy()
-		neg_indices = x[0] < 0
+		neg_indices = x[0] <= 0
 		y[neg_indices] = self.alpha * (np.exp(y[neg_indices]) - 1)
 		y *= self.lam
 		return y,
@@ -23,13 +23,13 @@ class SELU(function.Function):
 	def forward_gpu(self, x):
 		y = cuda.elementwise(
 			'T x, T alpha, T lam', 'T y',
-			'y = x >= 0 ? (T)(lam * x) : (T)(lam * alpha * (exp(x) - 1))',
+			'y = x > 0 ? (T)(lam * x) : (T)(lam * alpha * (exp(x) - 1))',
 			'elu_fwd')(x[0], self.alpha, self.lam)
 		return y,
 
 	def backward_cpu(self, x, gy):
 		gx = gy[0].copy()
-		neg_indices = x[0] < 0
+		neg_indices = x[0] <= 0
 		gx[neg_indices] *= self.alpha * np.exp(x[0][neg_indices])
 		gx *= self.lam
 		return gx,
@@ -37,7 +37,7 @@ class SELU(function.Function):
 	def backward_gpu(self, x, gy):
 		gx = cuda.elementwise(
 			'T x, T gy, T alpha, T lam', 'T gx',
-			'gx = x >= 0 ? (T)(lam * gy) : (T)(lam * gy * alpha * exp(x))',
+			'gx = x > 0 ? (T)(lam * gy) : (T)(lam * gy * alpha * exp(x))',
 			'elu_bwd')(
 				x[0], gy[0], self.alpha, self.lam)
 		return gx,
