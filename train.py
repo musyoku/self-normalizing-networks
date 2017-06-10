@@ -61,7 +61,7 @@ class SELUModel(chainer.Chain):
 class SELUDeepModel(chainer.Chain):
 	def __init__(self, num_layers=20):
 		super(SELUDeepModel, self).__init__(
-			logits=L.Linear(None, 10),
+			logits=L.Linear(None, 8),
 		)
 		self.num_layers = num_layers
 		for idx in xrange(num_layers):
@@ -99,7 +99,7 @@ class ReLUBatchNormModel(chainer.Chain):
 class ReLUBatchNormDeepModel(chainer.Chain):
 	def __init__(self, num_layers=20):
 		super(ReLUBatchNormDeepModel, self).__init__(
-			logits=L.Linear(None, 10),
+			logits=L.Linear(None, 8),
 		)
 		self.num_layers = num_layers
 		for idx in xrange(num_layers):
@@ -121,7 +121,7 @@ class ReLUBatchNormDeepModel(chainer.Chain):
 class ELUDeepModel(chainer.Chain):
 	def __init__(self, num_layers=20):
 		super(ELUDeepModel, self).__init__(
-			logits=L.Linear(None, 10),
+			logits=L.Linear(None, 8),
 		)
 		self.num_layers = num_layers
 		for idx in xrange(num_layers):
@@ -189,36 +189,40 @@ def get_mnist():
 	test_data = (test_data - np.mean(test_data)) / np.std(test_data)
 	return (train_data, np.asanyarray(train_label, dtype=np.int32)), (test_data, np.asanyarray(test_label, dtype=np.int32))
 
-def compute_accuracy(model, x, t, num_clusters=10):
+def compute_clustering_accuracy(model, x, t, num_clusters=10):
 	xp = model.xp
-	if model.xp is cuda.cupy:
-		x = cuda.to_gpu(x)
-		t = cuda.to_gpu(t)
-	with chainer.using_config("Train", False):
-		batches = xp.array_split(x, len(x) // 128)
-		probs = None
-		for batch in batches:
-			if batch.size > 0:
-				p = F.softmax(model(batch, apply_softmax=True)).data
-				probs = p if probs is None else xp.concatenate((probs, p), axis=0)
-		labels_predict = xp.argmax(probs, axis=1)
-		predict_counts = np.zeros((10, num_clusters), dtype=int)
+	batches = xp.split(x, len(x) // 100)
+	probs = None
+	for batch in batches:
+		p = F.softmax(model(batch, apply_softmax=True)).data
+		probs = p if probs is None else xp.concatenate((probs, p), axis=0)
+	labels_predict = xp.argmax(probs, axis=1)
+	predict_counts = np.zeros((10, num_clusters), dtype=int)
 
-		for i in xrange(len(x)):
-			label_predict = int(labels_predict[i])
-			label_true = int(t[i])
-			predict_counts[label_true, label_predict] += 1
+	for i in xrange(len(x)):
+		label_predict = int(labels_predict[i])
+		label_true = int(t[i])
+		predict_counts[label_true, label_predict] += 1
 
-		indices = np.argmax(predict_counts, axis=0)
-		match_count = np.zeros((10,), dtype=np.float32)
-		for i in xrange(num_clusters):
-			assinged_label = indices[i]
-			match_count[assinged_label] += predict_counts[assinged_label][i]
+	indices = np.argmax(predict_counts, axis=0)
+	match_count = np.zeros((10,), dtype=np.float32)
+	for i in xrange(num_clusters):
+		assinged_label = indices[i]
+		match_count[assinged_label] += predict_counts[assinged_label][i]
 
-		accuracy = np.sum(match_count) / len(x)
-		return predict_counts, accuracy
+	accuracy = np.sum(match_count) / len(x)
+	return predict_counts, accuracy
 
-def train(args):
+def compute_classification_accuracy(model, x, t):
+	xp = model.xp
+	batches = xp.split(x, len(x) // 100)
+	scores = None
+	for batch in batches:
+		p = F.softmax(model(batch, apply_softmax=False)).data
+		scores = p if scores is None else xp.concatenate((scores, p), axis=0)
+	return float(F.accuracy(scores, Variable(t)).data)
+
+def train_supervised(args):
 	try:
 		os.mkdir(args.out)
 	except:
@@ -240,16 +244,89 @@ def train(args):
 	# init optimizer
 	optimizer = optimizers.Adam(alpha=args.learning_rate, beta1=0.9)
 	optimizer.setup(model)
-	optimizer.add_hook(GradientClipping(1))
+	# optimizer.add_hook(GradientClipping(1))
+
+	train_data, train_label = mnist_train
+	test_data, test_label = mnist_test
+	if args.gpu_device >= 0:
+		train_data = cuda.to_gpu(train_data)
+		train_label = cuda.to_gpu(train_label)
+		test_data = cuda.to_gpu(test_data)
+		test_label = cuda.to_gpu(test_label)
+	train_loop = len(train_data) // args.batchsize
+	train_indices = np.arange(len(train_data))
+
+    # training cycle
+	for epoch in xrange(1, args.epoch):
+		np.random.shuffle(train_indices)	# shuffle data
+		sum_loss = 0
+
+		with chainer.using_config("Train", True):
+	        # loop over all batches
+			for itr in xrange(train_loop):
+				# sample minibatch
+				batch_range = np.arange(itr * args.batchsize, min((itr + 1) * args.batchsize, len(train_data)))
+				x = train_data[train_indices[batch_range]]
+				t = train_label[train_indices[batch_range]]
+
+				# to gpu
+				if model.xp is cuda.cupy:
+					x = cuda.to_gpu(x)
+					t = cuda.to_gpu(t)
+
+				logits = model(x, apply_softmax=True)
+				loss = F.softmax_cross_entropy(logits, Variable(t))
+
+				# update weights
+				optimizer.update(lossfun=lambda: loss)
+
+				if itr % 50 == 0:
+					sys.stdout.write("\riteration {}/{}".format(itr, train_loop))
+					sys.stdout.flush()
+				sum_loss += float(loss.data)
+
+		with chainer.using_config("Train", False):
+			accuracy_train = compute_classification_accuracy(model, train_data, train_label)
+			accuracy_test = compute_classification_accuracy(model, test_data, test_label)
+
+		sys.stdout.write("\r\033[2KEpoch {} - loss: {:.5f} - acc: {:.4f} (train), {:.4f} (test)\n".format(epoch, sum_loss / train_loop, accuracy_train, accuracy_test))
+		sys.stdout.flush()
+
+def train_unsupervised(args):
+	try:
+		os.mkdir(args.out)
+	except:
+		pass
+	mnist_train, mnist_test = get_mnist()
+
+	# seed
+	np.random.seed(args.seed)
+	if args.gpu_device != -1:
+		cuda.cupy.random.seed(args.seed)
+		
+	# init model
+	model = ELUDeepModel()
+	if args.gpu_device >= 0:
+		cuda.get_device(args.gpu_device).use()
+		model.to_gpu()
+	xp = model.xp
+
+	# init optimizer
+	optimizer = optimizers.Adam(alpha=args.learning_rate, beta1=0.9)
+	optimizer.setup(model)
+	# optimizer.add_hook(GradientClipping(1))
 
 	# IMSAT hyperparameters
 	lam = 0.2
 	mu = 4.0
 
 	train_data, train_label = mnist_train
+	test_data, test_label = mnist_test
 	if args.gpu_device >= 0:
 		train_data = cuda.to_gpu(train_data)
 		train_label = cuda.to_gpu(train_label)
+		test_data = cuda.to_gpu(test_data)
+		test_label = cuda.to_gpu(test_label)
 	train_loop = len(train_data) // args.batchsize
 	train_indices = np.arange(len(train_data))
 
@@ -295,9 +372,9 @@ def train(args):
 				sum_Rsat += float(Rsat.data)
 
 		with chainer.using_config("Train", False):
-			counts_train, accuracy_train = compute_accuracy(model, train_data, train_label)
+			counts_train, accuracy_train = compute_clustering_accuracy(model, train_data, train_label)
 			test_data, test_label = mnist_test
-			counts_test, accuracy_test = compute_accuracy(model, test_data, test_label)
+			counts_test, accuracy_test = compute_clustering_accuracy(model, test_data, test_label)
 
 		sys.stdout.write("\r\033[2KEpoch {} - loss: {:.5f} - acc: {:.4f} (train), {:.4f} (test) - hy: {:.4f} - hy_x: {:.4f} - Rsat: {:.4f}\n".format(epoch, sum_loss / train_loop, accuracy_train, accuracy_test, sum_hy / train_loop, sum_hy_x / train_loop, sum_Rsat / train_loop))
 		sys.stdout.flush()
@@ -313,4 +390,5 @@ if __name__ == "__main__":
 	parser.add_argument("--batchsize", "-b", type=int, default=256)
 	parser.add_argument("--seed", "-seed", type=int, default=0)
 	args = parser.parse_args()
-	train(args)
+	train_supervised(args)
+	# train_unsupervised(args)
