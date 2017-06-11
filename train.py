@@ -3,39 +3,13 @@ from __future__ import print_function
 from six.moves import xrange
 import chainer, argparse, os, sys, cupy, collections, six, math
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+import seaborn as sns
 from chainer import optimizers, iterators, cuda, Variable, initializers
 from chainer import links as L
 from chainer import functions as F
 from selu import selu
-
-
-from PIL import Image
-
-def _sum_sqnorm(arr):
-	sq_sum = collections.defaultdict(float)
-	for x in arr:
-		with cuda.get_device_from_array(x) as dev:
-			x = x.ravel()
-			s = x.dot(x)
-			sq_sum[int(dev)] += s
-	return sum([float(i) for i in six.itervalues(sq_sum)])
-	
-class GradientClipping(object):
-	name = "GradientClipping"
-
-	def __init__(self, threshold):
-		self.threshold = threshold
-
-	def __call__(self, opt):
-		norm = np.sqrt(_sum_sqnorm([p.grad for p in opt.target.params()]))
-		assert norm != 0
-		if norm < self.threshold:
-			return
-		rate = self.threshold / norm
-		for param in opt.target.params():
-			grad = param.grad
-			with cuda.get_device(grad):
-				grad *= rate
 
 class SELUModel(chainer.Chain):
 	def __init__(self):
@@ -58,26 +32,6 @@ class SELUModel(chainer.Chain):
 			out = F.softmax(out)
 		return out
 
-class SELUDeepModel(chainer.Chain):
-	def __init__(self, num_layers=20):
-		super(SELUDeepModel, self).__init__(
-			logits=L.Linear(None, 8),
-		)
-		self.num_layers = num_layers
-		for idx in xrange(num_layers):
-			self.add_link("layer_%s" % idx, L.Linear(None, 1000))
-
-	def __call__(self, x, apply_softmax=True):
-		xp = self.xp
-		out = x
-		for idx in xrange(self.num_layers):
-			layer = getattr(self, "layer_%s" % idx)
-			out = selu(layer(out))
-		out = self.logits(out)
-		if apply_softmax:
-			out = F.softmax(out)
-		return out
-
 class ReLUBatchNormModel(chainer.Chain):
 	def __init__(self):
 		super(ReLUBatchNormModel, self).__init__(
@@ -96,43 +50,81 @@ class ReLUBatchNormModel(chainer.Chain):
 			out = F.softmax(out)
 		return out
 
-class ReLUBatchNormDeepModel(chainer.Chain):
-	def __init__(self, num_layers=20):
-		super(ReLUBatchNormDeepModel, self).__init__(
-			logits=L.Linear(None, 8),
+class DeepModel(chainer.Chain):
+	def __init__(self, num_layers=8):
+		super(DeepModel, self).__init__(
+			logits=L.Linear(None, 10),
 		)
 		self.num_layers = num_layers
+		self.activations = []
 		for idx in xrange(num_layers):
 			self.add_link("layer_%s" % idx, L.Linear(None, 1000))
+
+class SELUDeepModel(DeepModel):
+	name = "SELU"
+	def __call__(self, x, apply_softmax=True):
+		del self.activations[:]
+		xp = self.xp
+		out = x
+		for idx in xrange(self.num_layers):
+			layer = getattr(self, "layer_%s" % idx)
+			out = selu(layer(out))
+			if chainer.config.train:
+				self.activations.append(out)
+		out = self.logits(out)
+		if apply_softmax:
+			out = F.softmax(out)
+		return out
+
+class ReLUBatchnormDeepModel(DeepModel):
+	name = "ReLU+BatchNorm"
+	def __init__(self, num_layers=8):
+		super(ReLUBatchnormDeepModel, self).__init__(num_layers=num_layers)
+		for idx in xrange(num_layers):
 			self.add_link("bn_%s" % idx, L.BatchNormalization(1000))
 
 	def __call__(self, x, apply_softmax=True):
+		del self.activations[:]
 		xp = self.xp
 		out = x
 		for idx in xrange(self.num_layers):
 			layer = getattr(self, "layer_%s" % idx)
 			batchnorm = getattr(self, "bn_%s" % idx)
 			out = batchnorm(F.relu(layer(out)))
+			if chainer.config.train:
+				self.activations.append(out)
 		out = self.logits(out)
 		if apply_softmax:
 			out = F.softmax(out)
 		return out
 
-class ELUDeepModel(chainer.Chain):
-	def __init__(self, num_layers=20):
-		super(ELUDeepModel, self).__init__(
-			logits=L.Linear(None, 8),
-		)
-		self.num_layers = num_layers
-		for idx in xrange(num_layers):
-			self.add_link("layer_%s" % idx, L.Linear(None, 1000))
-
+class RELUDeepModel(DeepModel):
+	name = "ReLU"
 	def __call__(self, x, apply_softmax=True):
+		del self.activations[:]
+		xp = self.xp
+		out = x
+		for idx in xrange(self.num_layers):
+			layer = getattr(self, "layer_%s" % idx)
+			out = F.relu(layer(out))
+			if chainer.config.train:
+				self.activations.append(out)
+		out = self.logits(out)
+		if apply_softmax:
+			out = F.softmax(out)
+		return out
+
+class ELUDeepModel(DeepModel):
+	name = "ELU"
+	def __call__(self, x, apply_softmax=True):
+		del self.activations[:]
 		xp = self.xp
 		out = x
 		for idx in xrange(self.num_layers):
 			layer = getattr(self, "layer_%s" % idx)
 			out = F.elu(layer(out))
+			if chainer.config.train:
+				self.activations.append(out)
 		out = self.logits(out)
 		if apply_softmax:
 			out = F.softmax(out)
@@ -222,9 +214,123 @@ def compute_classification_accuracy(model, x, t):
 		scores = p if scores is None else xp.concatenate((scores, p), axis=0)
 	return float(F.accuracy(scores, Variable(t)).data)
 
-def train_supervised(args):
+def plot_activations(model, x, out_dir):
 	try:
-		os.mkdir(args.out)
+		os.mkdir(out_dir)
+	except:
+		pass
+
+	if isinstance(model, DeepModel):
+		sns.set(font_scale=0.5)
+		fig = plt.figure()
+		num_layers = model.num_layers
+		
+		with chainer.using_config("Train", True):
+			xp = model.xp
+			batches = xp.split(x, len(x) // 200)
+			num_layers = model.num_layers
+			layer_activations = [None] * num_layers
+			for batch_idx, batch in enumerate(batches):
+				sys.stdout.write("\rplotting {}/{}".format(batch_idx + 1, len(batches)))
+				sys.stdout.flush()
+				logits = model(batch)
+				for layer_idx, activations in enumerate(model.activations):
+					data = cuda.to_cpu(activations.data).reshape((-1,))
+					# append
+					pool = layer_activations[layer_idx]
+					pool = data if pool is None else np.concatenate((pool, data))
+					layer_activations[layer_idx] = pool
+
+			fig, axes = plt.subplots(1, num_layers)
+			for layer_idx, (activations, ax) in enumerate(zip(layer_activations, axes)):
+				ax.hist(activations, bins=20)
+				ax.set_xlim([-5, 5])
+				ax.set_ylim([0, 60000 * 100])
+				ax.get_yaxis().set_major_formatter(mtick.FormatStrFormatter("%.e"))
+
+			fig.suptitle("%s Activation Distribution" % model.__class__.name)
+			plt.savefig(os.path.join(out_dir, "activation.png"), dpi=350)
+
+def train_supervised(args):
+	mnist_train, mnist_test = get_mnist()
+
+	# seed
+	np.random.seed(args.seed)
+	if args.gpu_device != -1:
+		cuda.cupy.random.seed(args.seed)
+		
+	# init model
+	model = None
+	if args.model.lower() == "selu":
+		model = SELUDeepModel()
+	elif args.model.lower() == "relu":
+		model = RELUDeepModel()
+	elif args.model.lower() == "bn":
+		model = ReLUBatchnormDeepModel()
+	elif args.model.lower() == "elu":
+		model = ELUDeepModel()
+	assert model is not None
+	if args.gpu_device >= 0:
+		cuda.get_device(args.gpu_device).use()
+		model.to_gpu()
+	xp = model.xp
+
+	# init optimizer
+	optimizer = optimizers.Adam(alpha=args.learning_rate, beta1=0.9)
+	optimizer.setup(model)
+
+	train_data, train_label = mnist_train
+	test_data, test_label = mnist_test
+	if args.gpu_device >= 0:
+		train_data = cuda.to_gpu(train_data)
+		train_label = cuda.to_gpu(train_label)
+		test_data = cuda.to_gpu(test_data)
+		test_label = cuda.to_gpu(test_label)
+	train_loop = len(train_data) // args.batchsize
+	train_indices = np.arange(len(train_data))
+
+	# training cycle
+	for epoch in xrange(1, args.epoch):
+		np.random.shuffle(train_indices)	# shuffle data
+		sum_loss = 0
+
+		with chainer.using_config("Train", True):
+			# loop over all batches
+			for itr in xrange(train_loop):
+				# sample minibatch
+				batch_range = np.arange(itr * args.batchsize, min((itr + 1) * args.batchsize, len(train_data)))
+				x = train_data[train_indices[batch_range]]
+				t = train_label[train_indices[batch_range]]
+
+				# to gpu
+				if model.xp is cuda.cupy:
+					x = cuda.to_gpu(x)
+					t = cuda.to_gpu(t)
+
+				logits = model(x, apply_softmax=False)
+				loss = F.softmax_cross_entropy(logits, Variable(t))
+
+				# update weights
+				optimizer.update(lossfun=lambda: loss)
+
+				if itr % 50 == 0:
+					sys.stdout.write("\riteration {}/{}".format(itr, train_loop))
+					sys.stdout.flush()
+				sum_loss += float(loss.data)
+
+		with chainer.using_config("Train", False):
+			accuracy_train = compute_classification_accuracy(model, train_data, train_label)
+			accuracy_test = compute_classification_accuracy(model, test_data, test_label)
+
+		sys.stdout.write("\r\033[2KEpoch {} - loss: {:.5f} - acc: {:.4f} (train), {:.4f} (test)\n".format(epoch, sum_loss / train_loop, accuracy_train, accuracy_test))
+		sys.stdout.flush()
+
+	# plot activations
+	plot_activations(model, test_data, args.model)
+
+def train_unsupervised(args):
+	try:
+		os.mkdir(args.model)
 	except:
 		pass
 	mnist_train, mnist_test = get_mnist()
@@ -244,77 +350,6 @@ def train_supervised(args):
 	# init optimizer
 	optimizer = optimizers.Adam(alpha=args.learning_rate, beta1=0.9)
 	optimizer.setup(model)
-	# optimizer.add_hook(GradientClipping(1))
-
-	train_data, train_label = mnist_train
-	test_data, test_label = mnist_test
-	if args.gpu_device >= 0:
-		train_data = cuda.to_gpu(train_data)
-		train_label = cuda.to_gpu(train_label)
-		test_data = cuda.to_gpu(test_data)
-		test_label = cuda.to_gpu(test_label)
-	train_loop = len(train_data) // args.batchsize
-	train_indices = np.arange(len(train_data))
-
-    # training cycle
-	for epoch in xrange(1, args.epoch):
-		np.random.shuffle(train_indices)	# shuffle data
-		sum_loss = 0
-
-		with chainer.using_config("Train", True):
-	        # loop over all batches
-			for itr in xrange(train_loop):
-				# sample minibatch
-				batch_range = np.arange(itr * args.batchsize, min((itr + 1) * args.batchsize, len(train_data)))
-				x = train_data[train_indices[batch_range]]
-				t = train_label[train_indices[batch_range]]
-
-				# to gpu
-				if model.xp is cuda.cupy:
-					x = cuda.to_gpu(x)
-					t = cuda.to_gpu(t)
-
-				logits = model(x, apply_softmax=True)
-				loss = F.softmax_cross_entropy(logits, Variable(t))
-
-				# update weights
-				optimizer.update(lossfun=lambda: loss)
-
-				if itr % 50 == 0:
-					sys.stdout.write("\riteration {}/{}".format(itr, train_loop))
-					sys.stdout.flush()
-				sum_loss += float(loss.data)
-
-		with chainer.using_config("Train", False):
-			accuracy_train = compute_classification_accuracy(model, train_data, train_label)
-			accuracy_test = compute_classification_accuracy(model, test_data, test_label)
-
-		sys.stdout.write("\r\033[2KEpoch {} - loss: {:.5f} - acc: {:.4f} (train), {:.4f} (test)\n".format(epoch, sum_loss / train_loop, accuracy_train, accuracy_test))
-		sys.stdout.flush()
-
-def train_unsupervised(args):
-	try:
-		os.mkdir(args.out)
-	except:
-		pass
-	mnist_train, mnist_test = get_mnist()
-
-	# seed
-	np.random.seed(args.seed)
-	if args.gpu_device != -1:
-		cuda.cupy.random.seed(args.seed)
-		
-	# init model
-	model = ELUDeepModel()
-	if args.gpu_device >= 0:
-		cuda.get_device(args.gpu_device).use()
-		model.to_gpu()
-	xp = model.xp
-
-	# init optimizer
-	optimizer = optimizers.Adam(alpha=args.learning_rate, beta1=0.9)
-	optimizer.setup(model)
-	# optimizer.add_hook(GradientClipping(1))
 
 	# IMSAT hyperparameters
 	lam = 0.2
@@ -330,7 +365,7 @@ def train_unsupervised(args):
 	train_loop = len(train_data) // args.batchsize
 	train_indices = np.arange(len(train_data))
 
-    # training cycle
+	# training cycle
 	for epoch in xrange(1, args.epoch):
 		np.random.shuffle(train_indices)	# shuffle data
 		sum_loss = 0
@@ -339,7 +374,7 @@ def train_unsupervised(args):
 		sum_Rsat = 0
 
 		with chainer.using_config("Train", True):
-	        # loop over all batches
+			# loop over all batches
 			for itr in xrange(train_loop):
 				# sample minibatch
 				batch_range = np.arange(itr * args.batchsize, (itr + 1) * args.batchsize)
@@ -383,10 +418,10 @@ def train_unsupervised(args):
 
 if __name__ == "__main__":
 	parser = argparse.ArgumentParser()
-	parser.add_argument("--out", "-o", type=str, default="model")
+	parser.add_argument("--model", "-m", type=str, default="selu")
 	parser.add_argument("--gpu-device", "-g", type=int, default=0)
 	parser.add_argument("--learning-rate", "-lr", type=float, default=0.002)
-	parser.add_argument("--epoch", "-e", type=int, default=500)
+	parser.add_argument("--epoch", "-e", type=int, default=50)
 	parser.add_argument("--batchsize", "-b", type=int, default=256)
 	parser.add_argument("--seed", "-seed", type=int, default=0)
 	args = parser.parse_args()
