@@ -269,7 +269,7 @@ def plot_activations(model, x, out_dir):
 				ax.set_ylim([0, 1e6])
 				ax.get_yaxis().set_major_formatter(mtick.FormatStrFormatter("%.e"))
 				mean, var = xp.mean(activations), xp.var(activations)
-				ax.set_title("mean: {:.3f}\nvar: {:.3f}".format(mean, var))
+				ax.set_title("Layer #{}\nmean: {:.3f}\nvar: {:.3f}".format(layer_idx + 1, mean, var))
 				print("layer #{} - mean: {:.4f} - var: {:.4f}".format(layer_idx + 1, mean, var))
 
 			fig.suptitle("%s Activation Distribution" % model.__class__.name)
