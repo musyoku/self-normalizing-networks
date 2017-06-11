@@ -62,6 +62,22 @@ class DeepModel(chainer.Chain):
 			self.add_link("layer_%s" % idx, L.Linear(None, 1000, initialW=initializers.Normal(math.sqrt(1. / input_units[idx]))))
 
 class SELUDeepModel(DeepModel):
+	name = "SELU"
+	def __call__(self, x, apply_softmax=True):
+		del self.activations[:]
+		xp = self.xp
+		out = x
+		for idx in xrange(self.num_layers):
+			layer = getattr(self, "layer_%s" % idx)
+			out = selu(layer(out))
+			if chainer.config.train == False:
+				self.activations.append(xp.copy(out.data))
+		out = self.logits(out)
+		if apply_softmax:
+			out = F.softmax(out)
+		return out
+
+class SELUAlphaDropoutDeepModel(DeepModel):
 	name = "SELU+AlphaDropout"
 	def __call__(self, x, apply_softmax=True):
 		del self.activations[:]
@@ -236,9 +252,7 @@ def plot_activations(model, x, out_dir):
 				sys.stdout.write("\rplotting {}/{}".format(batch_idx + 1, len(batches)))
 				sys.stdout.flush()
 				logits = model(batch)
-				print(len(model.activations))
 				for layer_idx, activations in enumerate(model.activations):
-					print(type(activations))
 					data = cuda.to_cpu(activations).reshape((-1,))
 					# append
 					pool = layer_activations[layer_idx]
@@ -266,9 +280,11 @@ def train_supervised(args):
 	model = None
 	if args.model.lower() == "selu":
 		model = SELUDeepModel()
+	elif args.model.lower() == "selu_dropout":
+		model = SELUAlphaDropoutDeepModel()
 	elif args.model.lower() == "relu":
 		model = RELUDeepModel()
-	elif args.model.lower() == "bn":
+	elif args.model.lower() == "relu_bn":
 		model = ReLUBatchnormDeepModel()
 	elif args.model.lower() == "elu":
 		model = ELUDeepModel()
