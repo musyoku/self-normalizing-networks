@@ -322,7 +322,7 @@ def train_supervised(args):
 			accuracy_train = compute_classification_accuracy(model, train_data, train_label)
 			accuracy_test = compute_classification_accuracy(model, test_data, test_label)
 
-		sys.stdout.write("\r\033[2KEpoch {} - loss: {:.5f} - acc: {:.4f} (train), {:.4f} (test)\n".format(epoch, sum_loss / train_loop, accuracy_train, accuracy_test))
+		sys.stdout.write("\r\033[2KEpoch {} - loss: {:.8f} - acc: {:.5f} (train), {:.5f} (test)\n".format(epoch, sum_loss / train_loop, accuracy_train, accuracy_test))
 		sys.stdout.flush()
 
 	# plot activations
