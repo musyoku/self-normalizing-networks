@@ -261,13 +261,16 @@ def plot_activations(model, x, out_dir):
 
 			sys.stdout.write("\r")
 			sys.stdout.flush()
-			
+
 			fig, axes = plt.subplots(1, num_layers)
 			for layer_idx, (activations, ax) in enumerate(zip(layer_activations, axes)):
 				ax.hist(activations, bins=100)
 				# ax.set_xlim([-5, 5])
+				ax.set_ylim([0, 1e6])
 				ax.get_yaxis().set_major_formatter(mtick.FormatStrFormatter("%.e"))
-				print("layer #{} - mean: {:.4f} - var: {:.4f}".format(layer_idx + 1, xp.mean(activations), xp.var(activations)))
+				mean, var = xp.mean(activations), xp.var(activations)
+				ax.set_title("mean: {:.3f}\nvar: {:.3f}".format(mean, var))
+				print("layer #{} - mean: {:.4f} - var: {:.4f}".format(layer_idx + 1, mean, var))
 
 			fig.suptitle("%s Activation Distribution" % model.__class__.name)
 			plt.savefig(os.path.join(out_dir, "activation.png"), dpi=350)
