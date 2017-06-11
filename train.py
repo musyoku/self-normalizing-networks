@@ -51,14 +51,15 @@ class ReLUBatchNormModel(chainer.Chain):
 		return out
 
 class DeepModel(chainer.Chain):
-	def __init__(self, num_layers=8):
+	def __init__(self, num_layers=8, hidden_units=1000):
 		super(DeepModel, self).__init__(
 			logits=L.Linear(None, 10),
 		)
 		self.num_layers = num_layers
 		self.activations = []
+		input_units = [768] + [hidden_units] * num_layers
 		for idx in xrange(num_layers):
-			self.add_link("layer_%s" % idx, L.Linear(None, 1000))
+			self.add_link("layer_%s" % idx, L.Linear(None, 1000, initialW=initializers.Normal(math.sqrt(1. / input_units[idx]))))
 
 class SELUDeepModel(DeepModel):
 	name = "SELU"
@@ -245,7 +246,6 @@ def plot_activations(model, x, out_dir):
 			for layer_idx, (activations, ax) in enumerate(zip(layer_activations, axes)):
 				ax.hist(activations, bins=20)
 				ax.set_xlim([-5, 5])
-				ax.set_ylim([0, 60000 * 100])
 				ax.get_yaxis().set_major_formatter(mtick.FormatStrFormatter("%.e"))
 
 			fig.suptitle("%s Activation Distribution" % model.__class__.name)
