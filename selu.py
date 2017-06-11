@@ -55,7 +55,7 @@ def dropout_selu(x, ratio=0.1, alpha=-1.7580993408473766):
 
 	xp = cuda.get_array_module(*x)
 	if xp == np:
-		d = xp.random.rand(*x[0].shape) >= ratio
+		d = np.random.rand(*x[0].shape) >= ratio
 	else:
 		d = xp.random.rand(*x[0].shape, dtype=np.float32) >= ratio
 
