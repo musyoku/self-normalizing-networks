@@ -11,45 +11,6 @@ from chainer import links as L
 from chainer import functions as F
 from selu import selu, dropout_selu
 
-class SELUModel(chainer.Chain):
-	def __init__(self):
-		super(SELUModel, self).__init__(
-			l1=L.Linear(None, 1200),
-			l2=L.Linear(None, 1200),
-			l3=L.Linear(None, 10),
-		)
-
-	def __call__(self, x, apply_softmax=True):
-		xp = self.xp
-		out = selu(self.l1(x))
-		# print(xp.mean(out.data), xp.std(out.data))
-		out = selu(self.l2(out))
-		# print(xp.mean(out.data), xp.std(out.data))
-		out = self.l3(out)
-		# print(out)
-		# print(xp.mean(out.data), xp.std(out.data))
-		if apply_softmax:
-			out = F.softmax(out)
-		return out
-
-class ReLUBatchNormModel(chainer.Chain):
-	def __init__(self):
-		super(ReLUBatchNormModel, self).__init__(
-			l1=L.Linear(None, 1200),
-			l2=L.Linear(None, 1200),
-			l3=L.Linear(None, 10),
-			bn1=L.BatchNormalization(1200),
-			bn2=L.BatchNormalization(1200),
-		)
-
-	def __call__(self, x, apply_softmax=True):
-		out = self.bn1(F.relu(self.l1(x)))
-		out = self.bn2(F.relu(self.l2(out)))
-		out = self.l3(out)
-		if apply_softmax:
-			out = F.softmax(out)
-		return out
-
 class DeepModel(chainer.Chain):
 	def __init__(self, num_layers=8, hidden_units=1000):
 		super(DeepModel, self).__init__(
@@ -275,7 +236,7 @@ def plot_activations(model, x, out_dir):
 			fig.suptitle("%s Activation Distribution" % model.__class__.name)
 			plt.savefig(os.path.join(out_dir, "activation.png"), dpi=350)
 
-def train_supervised(args):
+def train(args):
 	mnist_train, mnist_test = get_mnist()
 
 	# seed
@@ -354,94 +315,6 @@ def train_supervised(args):
 	# plot activations
 	plot_activations(model, test_data, args.model)
 
-def train_unsupervised(args):
-	try:
-		os.mkdir(args.model)
-	except:
-		pass
-	mnist_train, mnist_test = get_mnist()
-
-	# seed
-	np.random.seed(args.seed)
-	if args.gpu_device != -1:
-		cuda.cupy.random.seed(args.seed)
-		
-	# init model
-	model = SELUDeepModel()
-	if args.gpu_device >= 0:
-		cuda.get_device(args.gpu_device).use()
-		model.to_gpu()
-	xp = model.xp
-
-	# init optimizer
-	optimizer = optimizers.Adam(alpha=args.learning_rate, beta1=0.9)
-	optimizer.setup(model)
-
-	# IMSAT hyperparameters
-	lam = 0.2
-	mu = 4.0
-
-	train_data, train_label = mnist_train
-	test_data, test_label = mnist_test
-	if args.gpu_device >= 0:
-		train_data = cuda.to_gpu(train_data)
-		train_label = cuda.to_gpu(train_label)
-		test_data = cuda.to_gpu(test_data)
-		test_label = cuda.to_gpu(test_label)
-	train_loop = len(train_data) // args.batchsize
-	train_indices = np.arange(len(train_data))
-
-	# training cycle
-	for epoch in xrange(1, args.epoch):
-		np.random.shuffle(train_indices)	# shuffle data
-		sum_loss = 0
-		sum_hy = 0
-		sum_hy_x = 0
-		sum_Rsat = 0
-
-		with chainer.using_config("Train", True):
-			# loop over all batches
-			for itr in xrange(train_loop):
-				# sample minibatch
-				batch_range = np.arange(itr * args.batchsize, (itr + 1) * args.batchsize)
-				x = train_data[train_indices[batch_range]]
-				t = train_label[train_indices[batch_range]]
-
-				# to gpu
-				if model.xp is cuda.cupy:
-					x = cuda.to_gpu(x)
-					t = cuda.to_gpu(t)
-
-				p = model(x, apply_softmax=True)
-
-				# compute loss
-				hy = compute_marginal_entropy(p)
-				hy_x = F.mean(compute_entropy(p))
-				Rsat = -F.mean(compute_lds(model, x))
-				loss = Rsat - lam * (mu * hy - hy_x)
-				loss = F.softmax_cross_entropy(model(x, apply_softmax=False), Variable(t))
-
-				# update weights
-				optimizer.update(lossfun=lambda: loss)
-
-				if itr % 50 == 0:
-					sys.stdout.write("\riteration {}/{}".format(itr, train_loop))
-					sys.stdout.flush()
-				sum_loss += float(loss.data)
-				sum_hy += float(hy.data)
-				sum_hy_x += float(hy_x.data)
-				sum_Rsat += float(Rsat.data)
-
-		with chainer.using_config("Train", False):
-			counts_train, accuracy_train = compute_clustering_accuracy(model, train_data, train_label)
-			test_data, test_label = mnist_test
-			counts_test, accuracy_test = compute_clustering_accuracy(model, test_data, test_label)
-
-		sys.stdout.write("\r\033[2KEpoch {} - loss: {:.5f} - acc: {:.4f} (train), {:.4f} (test) - hy: {:.4f} - hy_x: {:.4f} - Rsat: {:.4f}\n".format(epoch, sum_loss / train_loop, accuracy_train, accuracy_test, sum_hy / train_loop, sum_hy_x / train_loop, sum_Rsat / train_loop))
-		sys.stdout.flush()
-		print(counts_train)
-		print(counts_test)
-
 if __name__ == "__main__":
 	parser = argparse.ArgumentParser()
 	parser.add_argument("--model", "-m", type=str, default="selu")
@@ -451,5 +324,4 @@ if __name__ == "__main__":
 	parser.add_argument("--batchsize", "-b", type=int, default=256)
 	parser.add_argument("--seed", "-seed", type=int, default=0)
 	args = parser.parse_args()
-	train_supervised(args)
-	# train_unsupervised(args)
+	train(args)
