@@ -244,7 +244,7 @@ def plot_activations(model, x, out_dir):
 
 			fig, axes = plt.subplots(1, num_layers)
 			for layer_idx, (activations, ax) in enumerate(zip(layer_activations, axes)):
-				ax.hist(activations, bins=20)
+				ax.hist(activations, bins=50)
 				ax.set_xlim([-5, 5])
 				ax.get_yaxis().set_major_formatter(mtick.FormatStrFormatter("%.e"))
 
