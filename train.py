@@ -109,41 +109,6 @@ class ELUDeepModel(DeepModel):
 			out = F.softmax(out)
 		return out
 
-def compute_entropy(p):
-	if p.ndim == 2:
-		return -F.sum(p * F.log(p + 1e-16), axis=1)
-	return -F.sum(p * F.log(p + 1e-16))
-
-def compute_marginal_entropy(p):
-	return compute_entropy(F.mean(p, axis=0))
-
-def compute_kld(p, q):
-	assert len(p) == len(q)
-	return F.reshape(F.sum(p * (F.log(p + 1e-16) - F.log(q + 1e-16)), axis=1), (-1, 1))
-
-def get_unit_vector(v):
-	xp = cuda.get_array_module(v)
-	if v.ndim == 4:
-		return v / (xp.sqrt(xp.sum(v ** 2, axis=(1,2,3))).reshape((-1, 1, 1, 1)) + 1e-16)
-	return v / (xp.sqrt(xp.sum(v ** 2, axis=1)).reshape((-1, 1)) + 1e-16)
-
-def compute_lds(model, x, xi=10, eps=1, Ip=1):
-	xp = cuda.get_array_module(x)
-	y1 = model(x, apply_softmax=True)
-	y1.unchain_backward()
-	d = Variable(get_unit_vector(np.random.normal(size=x.shape).astype(np.float32)))
-	if xp is cupy:
-		d.to_gpu()
-
-	for i in xrange(Ip):
-		y2 = model(x + xi * d, apply_softmax=True)
-		kld = F.sum(compute_kld(y1, y2))
-		kld.backward()
-		d = Variable(get_unit_vector(d.grad))
-	
-	y2 = model(x + eps * d, apply_softmax=True)
-	return -compute_kld(y1, y2)
-
 def get_mnist():
 	mnist_train, mnist_test = chainer.datasets.get_mnist()
 	train_data, train_label = [], []
@@ -159,30 +124,6 @@ def get_mnist():
 	train_data = (train_data - np.mean(train_data)) / np.std(train_data)
 	test_data = (test_data - np.mean(test_data)) / np.std(test_data)
 	return (train_data, np.asanyarray(train_label, dtype=np.int32)), (test_data, np.asanyarray(test_label, dtype=np.int32))
-
-def compute_clustering_accuracy(model, x, t, num_clusters=10):
-	xp = model.xp
-	batches = xp.split(x, len(x) // 100)
-	probs = None
-	for batch in batches:
-		p = F.softmax(model(batch, apply_softmax=True)).data
-		probs = p if probs is None else xp.concatenate((probs, p), axis=0)
-	labels_predict = xp.argmax(probs, axis=1)
-	predict_counts = np.zeros((10, num_clusters), dtype=int)
-
-	for i in xrange(len(x)):
-		label_predict = int(labels_predict[i])
-		label_true = int(t[i])
-		predict_counts[label_true, label_predict] += 1
-
-	indices = np.argmax(predict_counts, axis=0)
-	match_count = np.zeros((10,), dtype=np.float32)
-	for i in xrange(num_clusters):
-		assinged_label = indices[i]
-		match_count[assinged_label] += predict_counts[assinged_label][i]
-
-	accuracy = np.sum(match_count) / len(x)
-	return predict_counts, accuracy
 
 def compute_classification_accuracy(model, x, t):
 	xp = model.xp
