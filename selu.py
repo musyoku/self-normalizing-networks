@@ -1,3 +1,4 @@
+import chainer, math
 import numpy as np
 from chainer import cuda
 from chainer import function
@@ -45,3 +46,20 @@ class SELU(function.Function):
 
 def selu(x, alpha=1.6732632423543772848170429916717, lam=1.0507009873554804934193349852946):
 	return SELU(alpha, lam)(x)
+
+def dropout_selu(x, ratio=0.1, alpha=-1.7580993408473766):
+	if chainer.config.train == False:
+		return x
+
+	q = 1.0 - ratio
+
+	xp = cuda.get_array_module(*x)
+	if xp == np:
+		d = xp.random.rand(*x[0].shape) >= ratio
+	else:
+		d = xp.random.rand(*x[0].shape, dtype=np.float32) >= ratio
+
+	a = math.pow(q + alpha ** 2 * q * (1 - q), -0.5)
+	b = -a * (1 - q) * alpha
+
+	return a * (x * d + alpha * (1 - d)) + b

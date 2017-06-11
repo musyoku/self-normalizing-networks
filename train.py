@@ -9,7 +9,7 @@ import seaborn as sns
 from chainer import optimizers, iterators, cuda, Variable, initializers
 from chainer import links as L
 from chainer import functions as F
-from selu import selu
+from selu import selu, dropout_selu
 
 class SELUModel(chainer.Chain):
 	def __init__(self):
@@ -72,6 +72,7 @@ class SELUDeepModel(DeepModel):
 			out = selu(layer(out))
 			if chainer.config.train:
 				self.activations.append(out)
+			out = dropout_selu(out, ratio=0.1)
 		out = self.logits(out)
 		if apply_softmax:
 			out = F.softmax(out)
