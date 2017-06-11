@@ -62,7 +62,7 @@ class DeepModel(chainer.Chain):
 			self.add_link("layer_%s" % idx, L.Linear(None, 1000, initialW=initializers.Normal(math.sqrt(1. / input_units[idx]))))
 
 class SELUDeepModel(DeepModel):
-	name = "SELU"
+	name = "SELU+AlphaDropout"
 	def __call__(self, x, apply_softmax=True):
 		del self.activations[:]
 		xp = self.xp
@@ -70,8 +70,8 @@ class SELUDeepModel(DeepModel):
 		for idx in xrange(self.num_layers):
 			layer = getattr(self, "layer_%s" % idx)
 			out = selu(layer(out))
-			if chainer.config.train:
-				self.activations.append(out)
+			if chainer.config.train == False:
+				self.activations.append(xp.copy(out.data))
 			out = dropout_selu(out, ratio=0.1)
 		out = self.logits(out)
 		if apply_softmax:
@@ -93,8 +93,8 @@ class ReLUBatchnormDeepModel(DeepModel):
 			layer = getattr(self, "layer_%s" % idx)
 			batchnorm = getattr(self, "bn_%s" % idx)
 			out = batchnorm(F.relu(layer(out)))
-			if chainer.config.train:
-				self.activations.append(out)
+			if chainer.config.train == False:
+				self.activations.append(xp.copy(out.data))
 		out = self.logits(out)
 		if apply_softmax:
 			out = F.softmax(out)
@@ -109,8 +109,8 @@ class RELUDeepModel(DeepModel):
 		for idx in xrange(self.num_layers):
 			layer = getattr(self, "layer_%s" % idx)
 			out = F.relu(layer(out))
-			if chainer.config.train:
-				self.activations.append(out)
+			if chainer.config.train == False:
+				self.activations.append(xp.copy(out.data))
 		out = self.logits(out)
 		if apply_softmax:
 			out = F.softmax(out)
@@ -125,8 +125,8 @@ class ELUDeepModel(DeepModel):
 		for idx in xrange(self.num_layers):
 			layer = getattr(self, "layer_%s" % idx)
 			out = F.elu(layer(out))
-			if chainer.config.train:
-				self.activations.append(out)
+			if chainer.config.train == False:
+				self.activations.append(xp.copy(out.data))
 		out = self.logits(out)
 		if apply_softmax:
 			out = F.softmax(out)
@@ -227,7 +227,7 @@ def plot_activations(model, x, out_dir):
 		fig = plt.figure()
 		num_layers = model.num_layers
 		
-		with chainer.using_config("Train", True):
+		with chainer.using_config("train", False):
 			xp = model.xp
 			batches = xp.split(x, len(x) // 200)
 			num_layers = model.num_layers
@@ -236,8 +236,10 @@ def plot_activations(model, x, out_dir):
 				sys.stdout.write("\rplotting {}/{}".format(batch_idx + 1, len(batches)))
 				sys.stdout.flush()
 				logits = model(batch)
+				print(len(model.activations))
 				for layer_idx, activations in enumerate(model.activations):
-					data = cuda.to_cpu(activations.data).reshape((-1,))
+					print(type(activations))
+					data = cuda.to_cpu(activations).reshape((-1,))
 					# append
 					pool = layer_activations[layer_idx]
 					pool = data if pool is None else np.concatenate((pool, data))
@@ -295,9 +297,9 @@ def train_supervised(args):
 		np.random.shuffle(train_indices)	# shuffle data
 		sum_loss = 0
 
-		with chainer.using_config("Train", True):
+		with chainer.using_config("train", True):
 			# loop over all batches
-			for itr in xrange(train_loop):
+			for itr in xrange(1, train_loop + 1):
 				# sample minibatch
 				batch_range = np.arange(itr * args.batchsize, min((itr + 1) * args.batchsize, len(train_data)))
 				x = train_data[train_indices[batch_range]]
@@ -314,12 +316,12 @@ def train_supervised(args):
 				# update weights
 				optimizer.update(lossfun=lambda: loss)
 
-				if itr % 50 == 0:
+				if itr % 50 == 0 or itr == train_loop:
 					sys.stdout.write("\riteration {}/{}".format(itr, train_loop))
 					sys.stdout.flush()
 				sum_loss += float(loss.data)
 
-		with chainer.using_config("Train", False):
+		with chainer.using_config("train", False):
 			accuracy_train = compute_classification_accuracy(model, train_data, train_label)
 			accuracy_test = compute_classification_accuracy(model, test_data, test_label)
 
